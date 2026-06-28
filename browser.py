@@ -1,10 +1,15 @@
+import gzip
 import socket
 import ssl
+import time
+from typing import BinaryIO
 
 
 class URL:
     ALLOW_LIST = ["http", "https", "file", "data", "view-source"]
-    SOCKET_CACHE: dict[tuple[str, int], socket.socket] = {}
+    SOCKET_CACHE: dict[
+        tuple[str, int], tuple[ssl.SSLSocket | socket.socket, float]
+    ] = {}
 
     def __init__(self, url: str) -> None:
         self.view_source: bool = False
@@ -43,7 +48,27 @@ class URL:
             self.host, port = self.host.split(":", 1)
             self.port = int(port)
 
-    def request(self) -> str:
+    @staticmethod
+    def read_chunked(response: BinaryIO) -> bytes:
+        body = b""
+        while True:
+            size_line = response.readline()
+            if not size_line:
+                break  # connection closed unexpectedly
+            # Size is hex; ignore any chunk extensions after ';'.
+            size = int(size_line.split(b";")[0].strip(), 16)
+            if size == 0:
+                # Discard trailer headers up to the blank line.
+                while True:
+                    trailer = response.readline()
+                    if trailer in (b"\r\n", b"\n", b""):
+                        break
+                break
+            body += response.read(size)
+            response.readline()  # discard the CRLF after the chunk data
+        return body
+
+    def request(self, max_redirects: int = 10) -> str:
         if self.scheme == "file":
             with open(self.path, "r", encoding="utf-8") as f:
                 return f.read()
@@ -54,7 +79,13 @@ class URL:
 
         assert self.port is not None
         cache_key = (self.host, self.port)
-        s = self.SOCKET_CACHE.get(cache_key)
+        cached = self.SOCKET_CACHE.get(cache_key)
+        s = None
+        if cached is not None:
+            s, expiry = cached
+            if expiry == 0 or (expiry is not None and time.time() > expiry):
+                s = None
+                del self.SOCKET_CACHE[cache_key]
         if s is None:
             s = socket.socket(
                 family=socket.AF_INET, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP
@@ -66,31 +97,65 @@ class URL:
                 ctx = ssl.create_default_context()
                 s = ctx.wrap_socket(s, server_hostname=self.host)
 
-        request = "GET {} HTTP/1.0\r\n".format(self.path)
+        request = "GET {} HTTP/1.1\r\n".format(self.path)
         request += "Host: {}\r\n".format(self.host)
         request += "User-Agent: WebBrowserEngineering\r\n"
+        request += "Accept-Encoding: gzip\r\n"
         request += "\r\n"
         s.send(request.encode("utf8"))
 
-        response = s.makefile("r", encoding="utf8", newline="\r\n")
-
-        statusline = response.readline()
+        response = s.makefile("rb")  # raw bytes for gzip compatibility
+        statusline = response.readline().decode("utf8")
         version, status, explanation = statusline.split(" ", 2)
         # e.g. "HTTP/1.0", "200", "OK"
 
         response_headers = {}
         while True:
-            line = response.readline()
+            line = response.readline().decode("utf8")
             if line == "\r\n":
                 break
             header, value = line.split(":", 1)
             response_headers[header.casefold()] = value.strip()
 
-        assert "transfer-encoding" not in response_headers
-        assert "content-encoding" not in response_headers
+        if status.startswith("3"):
+            if max_redirects == 0:
+                raise Exception("too many redirects")
+            location = response_headers["location"]
+            if location.startswith("/"):
+                location = "{}://{}{}".format(self.scheme, self.host, location)
+            return URL(location).request(max_redirects=max_redirects - 1)
 
-        content_length = int(response_headers["content-length"])
+        expiry: float | None = None
+        cache_control = response_headers.get("cache-control", "")
+        if "no-store" in cache_control:
+            expiry = 0  # 0 means don't cache
+        elif "max-age=" in cache_control:
+            max_age = int(cache_control.split("max-age=")[1].split(",")[0])
+            expiry = time.time() + max_age
+        else:
+            expiry = 0  # unknown value, don't cache
 
-        content = response.read(content_length)
+        transfer_encoding = response_headers.get("transfer-encoding")
+        if transfer_encoding == "chunked":
+            body = self.read_chunked(response)
+        elif "content-length" in response_headers:
+            content_length = int(response_headers["content-length"])
+            body = response.read(content_length)
+        else:
+            # No framing info: the body runs until the server closes the
+            # socket, so this connection can't be reused.
+            body = response.read()
+            expiry = 0
+        if transfer_encoding not in (None, "chunked"):
+            raise Exception("unsupported transfer-encoding: " + transfer_encoding)
 
-        return content
+        # Undo Content-Encoding (we only advertised gzip).
+        content_encoding = response_headers.get("content-encoding")
+        if content_encoding == "gzip":
+            body = gzip.decompress(body)
+        elif content_encoding is not None:
+            raise Exception("unsupported content-encoding: " + content_encoding)
+
+        self.SOCKET_CACHE[cache_key] = (s, expiry)
+
+        return body.decode("utf8", errors="replace")
